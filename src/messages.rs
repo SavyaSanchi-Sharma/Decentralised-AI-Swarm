@@ -1,8 +1,9 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use crate::model::DynamicModel;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    Weights(Vec<f32>),
-    Ack(String),
-    RequestSync,
+    Model(DynamicModel),
+    ModelUpdate(DynamicModel),
+    RequestModel,
 }

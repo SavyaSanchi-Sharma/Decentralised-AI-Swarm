@@ -7,8 +7,8 @@ mod model;
 mod messages;
 
 #[derive(Parser)]
-#[command(name = "rusthive-federated")]
-#[command(about = "Federated neural training system in Rust", long_about = None)]
+#[command(name = "swarm")]
+#[command(about = "Federated training server + workers (dynamic, advanced)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -16,34 +16,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as server
+    /// Start the federated server (TCP for clients + HTTP REST API)
     Server {
         #[arg(long, default_value_t = String::from("0.0.0.0:50000"))]
-        addr: String,
+        tcp_addr: String,
+        #[arg(long, default_value_t = String::from("0.0.0.0:7000"))]
+        http_addr: String,
+        #[arg(long, default_value_t = 5000)]
+        sync_interval_ms: u64,
+        #[arg(long, default_value_t = String::from("training.log"))]
+        log_file: String,
     },
-    /// Run as client
+
+    /// Start a worker client node
     Client {
         #[arg(long)]
         id: String,
         #[arg(long)]
         server: String,
+        #[arg(long)]
+        http: String, // http base like http://127.0.0.1:7000
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { addr } => {
-            println!("🚀 Starting RustHive Server on {addr}");
-            // ✅ create server instance first
-            let server = server::Server::new();
-            server.run(&addr).await?;
+        Commands::Server { tcp_addr, http_addr, sync_interval_ms, log_file } => {
+            println!("🚀 Starting server: tcp={} http={}", tcp_addr, http_addr);
+            server::Server::run(&tcp_addr, &http_addr, sync_interval_ms, log_file).await?;
         }
-        Commands::Client { id, server } => {
-            println!("🤖 Starting Client `{id}`, connecting to {server}");
-            client::run_client(&id, &server).await?;
+        Commands::Client { id, server, http } => {
+            println!("🤖 Starting client: id={} server={} http={}", id, server, http);
+            client::run_client(&id, &server, &http).await?;
         }
     }
 
