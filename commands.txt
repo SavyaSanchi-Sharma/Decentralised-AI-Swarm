@@ -1,0 +1,29 @@
+
+curl -X POST $SERVER_HTTP/create_model \
+  -H "Content-Type: application/json" \
+  -d '{"input_dim":4,"hidden_layers":[8,8],"output_dim":1}'
+
+
+
+curl -X POST $SERVER_HTTP/upload_dataset \
+  -H "Content-Type: application/json" \
+  -d '[
+        [[0.3,0.1,-0.2,-0.4],[1]],
+        [[-0.5,0.2,0.1,-0.3],[0]],
+        [[0.7,-0.1,0.4,0.2],[1]],
+        [[-0.2,0.3,-0.5,0.1],[0]]
+      ]'
+
+
+curl -X POST $SERVER_HTTP/start_training \
+  -H "Content-Type: application/json" \
+  -d '{
+        "max_epochs": 20,
+        "stop_loss": 0.001,
+        "checkpoint_interval": 5,
+        "version": "demo1"
+      }'
+
+curl -X POST $SERVER_HTTP/stop_training
+
+curl -X POST $SERVER_HTTP/reset_dataset
