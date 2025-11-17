@@ -4,17 +4,37 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
+# --- Async Runtime ---
 tokio = { version = "1", features = ["full"] }
+
+# --- Web Framework / HTTP / WebSockets ---
+axum = { version = "0.*", features = ["ws", "json"] }
+tower = "0.4"
+tower-http = { version = "0.4", features = ["cors"] }
+
+# --- Networking Tools ---
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+futures = "0.3"
+
+# --- Serialization ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- Errors / Logging ---
 anyhow = "1"
-clap = { version = "4.1", features = ["derive"] }
-rand = "^0.9"
-tracing = "0.1.41"
-axum = "0.8.7"
-tracing-subscriber = "0.3.20"
-reqwest = {version = "0.12.24",features = ["json", "blocking", "rustls-tls"]}
-chrono = "0.4.42"
-hyper = "1.8.1"
-dotenv = "0.15.0"
+thiserror = "1"
+
+# --- Environment ---
+dotenv = "0.15"
+
+# --- Concurrency Utils ---
+parking_lot = "0.12"
+
+# --- Others ---
+uuid = { version = "1", features = ["v4"] }
+
+# --- Optional: for debugging heavy logs ---
+tokio-util = "0.7"
+rand = "0.9.2"
+clap = "3.*"
+
