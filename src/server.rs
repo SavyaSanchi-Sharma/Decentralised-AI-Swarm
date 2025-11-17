@@ -1,432 +1,387 @@
-use crate::model::DynamicModel;
-use crate::messages::Message;
+// src/server.rs
 use anyhow::Result;
-
 use axum::{
-    extract::State,
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::mpsc::UnboundedSender,
+};
 
-use serde_json::Value;
-use std::sync::{Arc, Mutex};
-
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-
-use std::net::SocketAddr;
-use std::fs::File;
-use std::io::Write;
-use std::time::Duration;
+use crate::{messages::TcpMessage, model::DynamicModel};
 
 #[derive(Clone)]
-pub struct TrainingState {
-    pub active: bool,
-    pub epochs_run: usize,
-    pub max_epochs: usize,
+pub struct TrainingParams {
     pub stop_loss: f32,
-    pub checkpoint_interval: usize,
-    pub version: String,
-    pub sync_interval_ms: u64,
+    pub max_epochs: usize,
 }
 
 #[derive(Clone)]
 pub struct ServerState {
     pub model: Arc<Mutex<Option<DynamicModel>>>,
-    pub dataset: Arc<Mutex<Vec<(Vec<f32>, Vec<f32>)>>>,
-    pub training: Arc<Mutex<TrainingState>>,
-    pub log_file: String,
+    pub datasets: Arc<Mutex<HashMap<String, Vec<(Vec<f32>, Vec<f32>)>>>>,
+    pub worker_sync: Arc<Mutex<HashMap<String, usize>>>,
+    pub params: Arc<Mutex<TrainingParams>>,
+    pub tcp_senders: Arc<Mutex<HashMap<String, UnboundedSender<String>>>>,
+    pub api_key: String,
 }
 
 pub struct Server;
 
 impl Server {
-    pub async fn run(tcp_addr: &str, http_addr: &str, sync_interval_ms: u64, log_file: String) -> Result<()> {
-        tracing::info!("Starting server: TCP={}  HTTP={}", tcp_addr, http_addr);
+    pub async fn run(tcp_addr: &str, http_addr: &str, api_key: String) -> Result<()> {
+        println!("\n====== FEDERATED SERVER STARTED ======");
+        println!("HTTP: {}", http_addr);
+        println!("TCP : {}", tcp_addr);
+        println!("API : {}", api_key);
+        println!("=====================================");
 
-        let model = Arc::new(Mutex::new(None));
-        let dataset = Arc::new(Mutex::new(Vec::new()));
+        let state = ServerState {
+            model: Arc::new(Mutex::new(None)),
+            datasets: Arc::new(Mutex::new(HashMap::new())),
+            worker_sync: Arc::new(Mutex::new(HashMap::new())),
+            params: Arc::new(Mutex::new(TrainingParams { stop_loss: 0.01, max_epochs: 20 })),
+            tcp_senders: Arc::new(Mutex::new(HashMap::new())),
+            api_key,
+        };
 
-        let training = Arc::new(Mutex::new(TrainingState {
-            active: false,
-            epochs_run: 0,
-            max_epochs: 0,
-            stop_loss: 0.01,
-            checkpoint_interval: 5,
-            version: "v0".to_string(),
-            sync_interval_ms,
-        }));
-
-
-        // --- Spawn TCP worker server ---
+        // spawn tcp loop
         let tcp_addr_owned = tcp_addr.to_string();
-        let model_for_tcp = model.clone();
+        let tcp_state = state.clone(); // Clone the local `state` variable, not `self.state`
+
+        // 2. Spawn the task, moving the owned data
         tokio::spawn(async move {
-            if let Err(e) = Self::tcp_worker_loop(&tcp_addr_owned, model_for_tcp).await {
-                tracing::error!("TCP worker loop failed: {:?}", e);
+            if let Err(e) = Self::tcp_accept_loop(&tcp_addr_owned, tcp_state).await {
+                // Handle the error instead of unwrapping
+                eprintln!("TCP loop failed: {:?}", e); 
             }
         });
 
-        // --- HTTP REST server ---
-        let state = ServerState {
-            model: model.clone(),
-            dataset: dataset.clone(),
-            training: training.clone(),
-            log_file: log_file.clone(),
-        };
-
-        let addr: SocketAddr = http_addr.parse().expect("invalid http addr");
-
-        // Build router and attach shared state
-        let app = Router::new()
+        // build router
+        let router = Router::new()
             .route("/create_model", post(Self::create_model))
             .route("/upload_dataset", post(Self::upload_dataset))
-            .route("/dataset", get(Self::get_dataset))
+            .route("/register_worker", post(Self::register_worker))
+            .route("/set_training_params", post(Self::set_training_params))
             .route("/start_training", post(Self::start_training))
-            .route("/stop_training", post(Self::stop_training))
-            .route("/training_status", get(Self::training_status))
-            .route("/train", post(Self::train_handler)) // keep for single-batch server-side training
+            .route("/get_dataset", get(Self::get_dataset))
+            .route("/get_model", get(Self::get_model))
+            .route("/get_training_params", get(Self::get_training_params))
+            .route("/sync_status", get(Self::sync_status))
             .route("/download_model", get(Self::download_model))
-            .with_state(state);
+            .with_state(state.clone());
 
-        // Bind listener and run axum 0.7 style
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        println!("HTTP server running on {}", addr);
+        // start HTTP
+        let addr: SocketAddr = http_addr.parse()?;
+let listener = TcpListener::bind(addr).await?;
 
-        // Note: axum::serve takes the listener + router
-        axum::serve(listener, app).await.unwrap();
+axum::serve(listener, router).await?;
+
         Ok(())
     }
 
-    // ======================================================================
-    // TCP Federated Worker Loop (unchanged behaviour)
-    // ======================================================================
-    async fn tcp_worker_loop(addr: &str, model: Arc<Mutex<Option<DynamicModel>>>) -> Result<()> {
+    // ------------------ TCP accept loop ------------------
+    async fn tcp_accept_loop(addr: &str, state: ServerState) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!("TCP workers listening on {}", addr);
+        println!("TCP listening on {}", addr);
 
         loop {
             let (stream, peer) = listener.accept().await?;
-            tracing::info!("Worker connected: {}", peer);
-
-            let model_for_task = model.clone();
-
+            println!("TCP connection from {}", peer);
+            let st = state.clone();
             tokio::spawn(async move {
-                let (r, mut w) = stream.into_split();
-                let mut reader = BufReader::new(r);
-                let mut line = String::new();
-
-                // --- Send model on connect (clone, then send) ---
-                {
-                    let maybe_model = { model_for_task.lock().unwrap().clone() };
-                    if let Some(m) = maybe_model {
-                        let msg = Message::Model(m);
-                        if let Ok(s) = serde_json::to_string(&msg) {
-                            if let Err(e) = w.write_all(format!("{}\n", s).as_bytes()).await {
-                                tracing::error!("Failed to send initial model to {}: {:?}", peer, e);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                loop {
-                    line.clear();
-
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => {
-                            tracing::info!("Worker {} disconnected", peer);
-                            break;
-                        }
-                        Ok(_) => {
-                            match serde_json::from_str::<Message>(&line) {
-                                Ok(Message::ModelUpdate(client_model)) => {
-                                    {
-                                        let mut global = model_for_task.lock().unwrap();
-                                        if let Some(g) = &mut *global {
-                                            g.merge_inplace(&client_model, 0.5);
-                                        } else {
-                                            *global = Some(client_model.clone());
-                                        }
-                                    } // lock dropped
-                                    // reply with fresh copy
-                                    let maybe_global = { model_for_task.lock().unwrap().clone() };
-                                    if let Some(g) = maybe_global {
-                                        let reply = Message::Model(g);
-                                        if let Ok(s) = serde_json::to_string(&reply) {
-                                            if let Err(e) = w.write_all(format!("{}\n", s).as_bytes()).await {
-                                                tracing::error!("Failed to send updated model to {}: {:?}", peer, e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(Message::RequestModel) => {
-                                    let maybe_global = { model_for_task.lock().unwrap().clone() };
-                                    if let Some(g) = maybe_global {
-                                        let reply = Message::Model(g);
-                                        if let Ok(s) = serde_json::to_string(&reply) {
-                                            if let Err(e) = w.write_all(format!("{}\n", s).as_bytes()).await {
-                                                tracing::error!("Failed to send model to {}: {:?}", peer, e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::error!("Malformed message from {}: {:?} -- raw: {}", peer, e, line.trim());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("TCP read error from {}: {:?}", peer, e);
-                            break;
-                        }
-                    }
+                if let Err(e) = Server::handle_tcp(stream, st).await {
+                    eprintln!("handle_tcp error: {:?}", e);
                 }
             });
         }
     }
 
-    // ======================================================================
-    // POST /create_model (same)
-    // ======================================================================
+    async fn handle_tcp(stream: TcpStream, state: ServerState) -> Result<()> {
+        let peer = stream.peer_addr()?.to_string();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        
+        // create local channel for sending server->worker messages
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut worker_id_opt: Option<String> = None;
+        
+        // spawn writer task
+        let mut writer = w;
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let _ = writer.write_all(msg.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+            }
+        });
+        
+        // read loop
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                println!("TCP {} disconnected", peer);
+                break;
+            }
+            
+            let raw = line.trim();
+            if raw.is_empty() { continue; }
+            
+            match serde_json::from_str::<TcpMessage>(raw) {
+                Ok(TcpMessage::RequestModel { worker_id }) => {
+                    println!("TCP register: {}", worker_id);
+                    worker_id_opt = Some(worker_id.clone());
+                    state.tcp_senders.lock().unwrap().insert(worker_id.clone(), tx.clone());
+                    
+                    // send current model if exists
+                    if let Some(m) = &*state.model.lock().unwrap() {
+                        let msg = TcpMessage::Model { model: m.clone() };
+                        let s = serde_json::to_string(&msg).unwrap();
+                        let _ = tx.send(s);
+                    }
+                }
+                Ok(TcpMessage::ModelUpdate { worker_id, round, model }) => {
+                    println!("TCP update from {} round {}", worker_id, round);
+                    
+                    // merge into global
+                    {
+                        let mut global = state.model.lock().unwrap();
+                        if let Some(g) = &mut *global {
+                            g.merge_inplace(&model, 0.5);
+                        } else {
+                            *global = Some(model.clone());
+                        }
+                    }
+                    
+                    // track updates count
+                    *state.worker_sync.lock().unwrap().entry(worker_id).or_insert(0) += 1;
+                    
+                    // broadcast merged model to all workers
+                    let broadcast_model = {
+                        let guard = state.model.lock().unwrap();
+                        guard.as_ref().map(|m| TcpMessage::Model { model: m.clone() })
+                    };
+                    
+                    if let Some(msg) = broadcast_model {
+                        let s = serde_json::to_string(&msg).unwrap();
+                        let mut dead = Vec::new();
+                        
+                        {
+                            let senders = state.tcp_senders.lock().unwrap();
+                            for (wid, sender) in senders.iter() {
+                                if sender.send(s.clone()).is_err() {
+                                    dead.push(wid.clone());
+                                }
+                            }
+                        }
+                        
+                        if !dead.is_empty() {
+                            let mut map = state.tcp_senders.lock().unwrap();
+                            for d in dead { 
+                                map.remove(&d); 
+                                println!("Removed dead tcp {}", d); 
+                            }
+                        }
+                    }
+                }
+                Ok(TcpMessage::Heartbeat { worker_id }) => {
+                    // ignore or update last seen
+                    println!("heartbeat {}", worker_id);
+                }
+                Ok(TcpMessage::Start) => {
+                    // Workers should never send Start messages; ignore
+                    println!("Unexpected Start message from worker");
+                }
+                Ok(TcpMessage::Model { .. }) => {
+                    // Workers should never send Model messages; ignore
+                    println!("Unexpected Model message from worker");
+                }
+                Err(e) => {
+                    println!("TCP parse error: {} | raw: {}", e, raw);
+                }
+            }
+        }
+        
+        // cleanup
+        if let Some(wid) = worker_id_opt {
+            state.tcp_senders.lock().unwrap().remove(&wid);
+        }
+        
+        Ok(())
+    }
+
+    // ------------------ HTTP endpoints ------------------
+
+    fn check_api(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
+        if expected.is_empty() { return Ok(()); }
+        let got = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        match got {
+            Some(k) if k == expected => Ok(()),
+            _ => {
+                println!("⛔ Unauthorized (got={:?}, expected=...)", got);
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+    }
+
     async fn create_model(
         State(state): State<ServerState>,
+        headers: HeaderMap,
         Json(payload): Json<Value>,
-    ) -> Json<String> {
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+
         let input_dim = payload.get("input_dim").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
-
-        let hidden_layers_json = payload
-            .get("hidden_layers")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let mut hidden_layers = Vec::new();
-        for h in hidden_layers_json {
-            if let Some(n) = h.as_u64() {
-                hidden_layers.push(n as usize);
-            }
-        }
-
+        let hidden = payload.get("hidden_layers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let output_dim = payload.get("output_dim").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
 
-        let mut layer_sizes = vec![input_dim];
-        layer_sizes.extend(hidden_layers);
-        layer_sizes.push(output_dim);
+        let mut layers = vec![input_dim];
+        for h in hidden { if let Some(n) = h.as_u64() { layers.push(n as usize); } }
+        layers.push(output_dim);
 
-        let model = DynamicModel::new(layer_sizes);
+        let model = DynamicModel::new(layers.clone());
         *state.model.lock().unwrap() = Some(model);
 
-        tracing::info!("Created new global model");
-        Json("model created".to_string())
+        println!("✔ Model created: {:?}", layers);
+        Ok(Json(json!({"status":"ok","layer_sizes": layers})))
     }
 
-    // ======================================================================
-    // POST /upload_dataset
-    //   body: [ [[x...],[y...]], ... ]
-    // ======================================================================
     async fn upload_dataset(
         State(state): State<ServerState>,
-        Json(payload): Json<Vec<(Vec<f32>, Vec<f32>)>>,
-    ) -> Json<String> {
-        let mut ds = state.dataset.lock().unwrap();
-        *ds = payload;
-        tracing::info!("Uploaded dataset with {} samples", ds.len());
-        Json(format!("dataset uploaded, {} samples", ds.len()))
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+
+        let worker_id = payload["worker_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?.to_string();
+        let data = payload["data"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+
+        let mut parsed: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        for sample in data.iter() {
+            let arr_x = sample["x"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+            let arr_y = sample["y"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+            let x = arr_x.iter().map(|v| v.as_f64().unwrap() as f32).collect();
+            let y = arr_y.iter().map(|v| v.as_f64().unwrap() as f32).collect();
+            parsed.push((x, y));
+        }
+
+        state.datasets.lock().unwrap().insert(worker_id.clone(), parsed);
+        println!("📥 Valid dataset uploaded for {}", worker_id);
+        Ok(Json(json!({"status":"ok"})))
     }
 
-    // GET /dataset  (workers fetch)
-    async fn get_dataset(State(state): State<ServerState>) -> Json<Vec<(Vec<f32>, Vec<f32>)>> {
-        let ds = state.dataset.lock().unwrap();
-        Json(ds.clone())
+    async fn register_worker(
+        State(state): State<ServerState>,
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+        let worker_id = payload["worker_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?.to_string();
+
+        state.datasets.lock().unwrap().entry(worker_id.clone()).or_insert(vec![]);
+        state.worker_sync.lock().unwrap().entry(worker_id.clone()).or_insert(0usize);
+
+        println!("🟢 Worker registered: {}", worker_id);
+        Ok(Json(json!({"status":"registered","worker_id":worker_id})))
     }
 
-    // ======================================================================
-    // POST /start_training
-    // payload: {"max_epochs":50,"stop_loss":0.01,"checkpoint_interval":5,"version":"exp1"}
-    // ======================================================================
+    async fn set_training_params(
+        State(state): State<ServerState>,
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+        let mut p = state.params.lock().unwrap();
+        p.stop_loss = payload.get("stop_loss").and_then(|v| v.as_f64()).unwrap_or(0.01) as f32;
+        p.max_epochs = payload.get("max_epochs").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        println!("⚙ Updated training params stop_loss={} max_epochs={}", p.stop_loss, p.max_epochs);
+        Ok(Json(json!({"status":"ok"})))
+    }
+
     async fn start_training(
         State(state): State<ServerState>,
-        Json(payload): Json<Value>,
-    ) -> Json<String> {
-        // parse params
-        let max_epochs = payload.get("max_epochs").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let stop_loss = payload.get("stop_loss").and_then(|v| v.as_f64()).unwrap_or(0.01) as f32;
-        let checkpoint_interval = payload.get("checkpoint_interval").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let version = payload.get("version").and_then(|v| v.as_str()).unwrap_or("run").to_string();
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+        println!("🚀 Broadcast START to workers");
 
-        {
-            let mut ts = state.training.lock().unwrap();
-            ts.active = true;
-            ts.max_epochs = max_epochs;
-            ts.stop_loss = stop_loss;
-            ts.checkpoint_interval = checkpoint_interval;
-            ts.version = version.clone();
-            ts.epochs_run = 0;
-        }
-
-        // spawn monitor task
-        let model_clone = state.model.clone();
-        let dataset_clone = state.dataset.clone();
-        let training_clone = state.training.clone();
-        let log_file = state.log_file.clone();
-
-        tokio::spawn(async move {
-            // training monitor loop
-            loop {
-                {
-                    let ts = training_clone.lock().unwrap().clone();
-                    if !ts.active {
-                        tracing::info!("Training stopped by external signal");
-                        break;
-                    }
-                }
-
-                // Evaluate loss on dataset if model exists
-                let maybe_model = { model_clone.lock().unwrap().clone() };
-                let ds = { dataset_clone.lock().unwrap().clone() };
-
-                let mut current_loss = std::f32::INFINITY;
-
-                if let Some(m) = maybe_model {
-                    if !ds.is_empty() {
-                        let mut s = 0.0f32;
-                        for (x, y) in ds.iter() {
-                            let (pred, _) = m.forward(x);
-                            for i in 0..pred.len() {
-                                let e = pred[i] - y[i];
-                                s += 0.5 * e * e;
-                            }
-                        }
-                        current_loss = s / (ds.len() as f32);
-                    }
-                }
-
-                // increment epoch count
-                {
-                    let mut ts = training_clone.lock().unwrap();
-                    ts.epochs_run += 1;
-                    let epoch = ts.epochs_run;
-                    // checkpoint and logging
-                    if epoch % ts.checkpoint_interval == 0 || current_loss.is_finite() && current_loss < ts.stop_loss {
-                        // save checkpoint
-                        if let Some(g) = model_clone.lock().unwrap().clone() {
-                            let fname = format!("trained_model_{}_epoch{}.json", ts.version, epoch);
-                            if let Ok(json) = serde_json::to_string_pretty(&g) {
-                                if let Ok(mut f) = File::create(&fname) {
-                                    let _ = f.write_all(json.as_bytes());
-                                    tracing::info!("Saved checkpoint {}", fname);
-                                }
-                            }
-                        }
-                        // append training log
-                        let _ = append_training_log(&log_file, ts.epochs_run, current_loss);
-                    }
-
-                    // check stopping criteria
-                    if (current_loss.is_finite() && current_loss < ts.stop_loss) || ts.epochs_run >= ts.max_epochs {
-                        ts.active = false;
-                        tracing::info!("Stopping training: epoch={} loss={}", ts.epochs_run, current_loss);
-                        // final save
-                        if let Some(g) = model_clone.lock().unwrap().clone() {
-                            let fname = format!("trained_model_{}_final.json", ts.version);
-                            if let Ok(json) = serde_json::to_string_pretty(&g) {
-                                if let Ok(mut f) = File::create(&fname) {
-                                    let _ = f.write_all(json.as_bytes());
-                                    tracing::info!("Saved final model {}", fname);
-                                }
-                            }
-                        }
-                        // append final log
-                        let _ = append_training_log(&log_file, ts.epochs_run, current_loss);
-                        break;
-                    }
-                }
-
-                let interval_ms = { training_clone.lock().unwrap().sync_interval_ms };
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        let msg = serde_json::to_string(&TcpMessage::Start).unwrap();
+        let mut dead = Vec::new();
+        let senders = state.tcp_senders.lock().unwrap();
+        for (wid, tx) in senders.iter() {
+            if tx.send(msg.clone()).is_err() {
+                dead.push(wid.clone());
             }
-        });
-
-        Json(format!("training started (version={})", version))
-    }
-
-    // POST /stop_training
-    async fn stop_training(State(state): State<ServerState>) -> Json<String> {
-        let mut ts = state.training.lock().unwrap();
-        ts.active = false;
-        Json("stopping training".to_string())
-    }
-
-    // GET /training_status
-    async fn training_status(State(state): State<ServerState>) -> Json<Value> {
-        let ts = state.training.lock().unwrap().clone();
-        let obj = serde_json::json!({
-            "active": ts.active,
-            "epochs_run": ts.epochs_run,
-            "max_epochs": ts.max_epochs,
-            "stop_loss": ts.stop_loss,
-            "checkpoint_interval": ts.checkpoint_interval,
-            "version": ts.version,
-        });
-        Json(obj)
-    }
-
-    // server-side /train (single-batch helper, unchanged)
-    async fn train_handler(
-        State(state): State<ServerState>,
-        Json(payload): Json<Vec<(Vec<f32>, Vec<f32>)>>,
-    ) -> Json<String> {
-        let mut model_guard = state.model.lock().unwrap();
-
-        if model_guard.is_none() {
-            return Json("No model created".to_string());
+        }
+        drop(senders);
+        if !dead.is_empty() {
+            let mut map = state.tcp_senders.lock().unwrap();
+            for d in dead { map.remove(&d); }
         }
 
-        let model = model_guard.as_mut().unwrap();
-
-        let xs: Vec<Vec<f32>> = payload.iter().map(|p| p.0.clone()).collect();
-        let ys: Vec<Vec<f32>> = payload.iter().map(|p| p.1.clone()).collect();
-
-        let loss = model.train_step(&xs, &ys, 0.01);
-
-        tracing::info!("Server trained one batch, loss={}", loss);
-
-        Json(format!("trained global model, loss={:.4}", loss))
+        Ok(Json(json!({"status":"started"})))
     }
 
-    // GET /download_model (final)
-    async fn download_model(
+    async fn get_dataset(
         State(state): State<ServerState>,
-    ) -> (StatusCode, (HeaderMap, String)) {
-        let model_guard = state.model.lock().unwrap();
-
-        if model_guard.is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                (HeaderMap::new(), "no model".to_string())
-            );
+        Query(q): Query<HashMap<String,String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let worker = q.get("worker_id").ok_or(StatusCode::BAD_REQUEST)?;
+        let map = state.datasets.lock().unwrap();
+        if let Some(ds) = map.get(worker) {
+            let arr: Vec<Value> = ds.iter().map(|(x,y)| json!({"x": x, "y": y})).collect();
+            return Ok(Json(Value::Array(arr)));
         }
-
-        let model = model_guard.as_ref().unwrap();
-        let json = serde_json::to_string_pretty(model).unwrap();
-
-        let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-        headers.insert("Content-Disposition", HeaderValue::from_static("attachment; filename=trained_model.json"));
-
-        (StatusCode::OK, (headers, json))
+        Ok(Json(Value::Array(vec![])))
     }
-}
 
-// helper to append logs
-fn append_training_log(path: &str, epoch: usize, loss: f32) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "epoch={}, loss={}", epoch, loss)?;
-    Ok(())
+    async fn get_model(
+        State(state): State<ServerState>,
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, StatusCode> {
+        Self::check_api(&headers, &state.api_key)?;
+        let guard = state.model.lock().unwrap();
+        if let Some(m) = &*guard {
+            return Ok(Json(serde_json::to_value(m).unwrap()));
+        }
+        Err(StatusCode::NO_CONTENT)
+    }
+
+    async fn get_training_params(
+        State(state): State<ServerState>
+    ) -> Result<Json<Value>, StatusCode> {
+        let p = state.params.lock().unwrap();
+        Ok(Json(json!({"stop_loss": p.stop_loss, "max_epochs": p.max_epochs})))
+    }
+
+    async fn sync_status(State(state): State<ServerState>) -> Result<Json<Value>, StatusCode> {
+        let map = state.worker_sync.lock().unwrap();
+        let mut out = serde_json::Map::new();
+        for (k, v) in map.iter() {
+            out.insert(k.clone(), json!({"updates": v}));
+        }
+        Ok(Json(Value::Object(out)))
+    }
+
+    async fn download_model(State(state): State<ServerState>) -> (StatusCode, (axum::http::HeaderMap, String)) {
+        let guard = state.model.lock().unwrap();
+        if guard.is_none() {
+            return (StatusCode::BAD_REQUEST, (axum::http::HeaderMap::new(), "no model".into()));
+        }
+        let body = serde_json::to_string_pretty(guard.as_ref().unwrap()).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/json"));
+        headers.insert("Content-Disposition", axum::http::HeaderValue::from_static("attachment; filename=model.json"));
+        (StatusCode::OK, (headers, body))
+    }
 }

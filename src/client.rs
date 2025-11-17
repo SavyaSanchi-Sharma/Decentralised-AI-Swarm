@@ -1,174 +1,127 @@
-use crate::messages::Message;
-use crate::model::DynamicModel;
+// src/client.rs
 use anyhow::Result;
+use reqwest::Client;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    time::{sleep, Duration},
+};
 
-use rand::Rng;
-use serde_json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use std::time::Duration;
+use crate::{messages::TcpMessage, model::DynamicModel};
 
-use reqwest::Client as HttpClient;
+pub async fn run_client(id: &str, tcp_addr: &str, http_addr: &str) -> Result<()> {
+    println!("🤖 Worker `{}` starting. TCP={} HTTP={}", id, tcp_addr, http_addr);
 
-// ===============================================================
-// Worker Client Node
-// ===============================================================
-pub async fn run_client(id: &str, server_tcp: &str, server_http: &str) -> Result<()> {
-    println!("🤖 Starting client `{}` connecting to {}", id, server_tcp);
+    let api_key = std::env::var("API_KEY").expect("API_KEY missing");
+    let http_client = Client::new();
 
-    // ---- TCP connection to server for federated learning ----
-    let stream = TcpStream::connect(server_tcp).await?;
-    let (r, mut w) = stream.into_split();
+    // connect tcp
+    let mut stream = TcpStream::connect(tcp_addr).await?;
+    let (r, mut w) = stream.split();
     let mut reader = BufReader::new(r);
-    let mut line = String::new();
 
-    let mut model_opt: Option<DynamicModel> = None;
-    let http = HttpClient::new();
+    // register via TCP for model pushes
+    let reg = TcpMessage::RequestModel { worker_id: id.to_string() };
+    let reg_s = serde_json::to_string(&reg)? + "\n";
+    w.write_all(reg_s.as_bytes()).await?;
+    println!("🔌 TCP registered as {}", id);
 
-    // Initially request a model
-    send_request_model(&mut w).await?;
-
+    // wait until dataset uploaded on server
     loop {
-        // ============================================================
-        // 1) POLL TRAINING STATUS (HTTP)
-        // ============================================================
-        let status = http.get(format!("{}/training_status", server_http))
-            .send().await;
+        let url = format!("{}/get_dataset?worker_id={}", http_addr.trim_end_matches('/'), id);
+        match http_client.get(&url).header("x-api-key", api_key.clone()).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let val: Value = resp.json().await.unwrap_or(Value::Null);
+                if let Some(arr) = val.as_array() {
+                    if !arr.is_empty() {
+                        println!("📥 Loaded {} samples for worker {}", arr.len(), id);
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        println!("⏳ Worker {} waiting for dataset...", id);
+        sleep(Duration::from_secs(2)).await;
+    }
 
-        let mut training_active = false;
-        let mut epochs_run = 0usize;
+    // Wait for Start command over TCP
+    println!("⏳ Worker {} waiting for Start...", id);
+    loop {
+        let mut ln = String::new();
+        let n = reader.read_line(&mut ln).await?;
+        if n == 0 { println!("TCP closed"); return Ok(()); }
+        let trimmed = ln.trim();
+        if trimmed.is_empty() { continue; }
+        match serde_json::from_str::<TcpMessage>(trimmed) {
+            Ok(TcpMessage::Start) => {
+                println!("🚀 Worker {} received Start", id);
+                break;
+            }
+            Ok(TcpMessage::Model { model: _ }) => {
+                // model pushed early — ignore until start
+            }
+            Err(e) => {
+                println!("TCP parse error on client: {} | raw: {}", e, trimmed);
+            }
+            _ => {}
+        }
+    }
 
-        if let Ok(resp) = status {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                training_active = json.get("active")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+    // fetch training params
+    let params = http_client.get(format!("{}/get_training_params", http_addr))
+        .header("x-api-key", api_key.clone())
+        .send().await?.json::<Value>().await?;
+    let stop_loss = params["stop_loss"].as_f64().unwrap_or(0.01) as f32;
+    let max_epochs = params["max_epochs"].as_u64().unwrap_or(20) as usize;
 
-                epochs_run = json.get("epochs_run")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+    // fetch dataset (again)
+    let ds_resp = http_client.get(format!("{}/get_dataset?worker_id={}", http_addr, id))
+        .header("x-api-key", api_key.clone()).send().await?;
+    let ds_json: Value = ds_resp.json().await?;
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for s in ds_json.as_array().unwrap() {
+        xs.push(s["x"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect::<Vec<f32>>());
+        ys.push(s["y"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect::<Vec<f32>>());
+    }
+
+    // fetch current model
+    let model: DynamicModel = loop {
+        let resp = http_client.get(format!("{}/get_model", http_addr))
+            .header("x-api-key", api_key.clone()).send().await?;
+        if resp.status().is_success() {
+            let txt = resp.text().await?;
+            match serde_json::from_str(&txt) {
+                Ok(m) => break m,
+                Err(_) => { sleep(Duration::from_secs(1)).await; continue; }
             }
         }
+        sleep(Duration::from_secs(1)).await;
+    };
 
-        // ============================================================
-        // 2) TRAINING HAS NOT STARTED YET — WAIT (DON'T EXIT)
-        // ============================================================
-        if !training_active && epochs_run == 0 {
-            println!("[{}] Waiting for training to start...", id);
+    let mut model = model;
 
-            // stay alive — request model to sync whenever ready
-            send_request_model(&mut w).await?;
+    // training loop
+    for epoch in 1..=max_epochs {
+        let loss = model.train_step(&xs, &ys, 0.01);
+        println!("[{}] epoch {}/{} loss={:.6}", id, epoch, max_epochs, loss);
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
+        // send update via TCP
+        let upd = TcpMessage::ModelUpdate { worker_id: id.to_string(), round: epoch as u64, model: model.clone() };
+        let upd_s = serde_json::to_string(&upd)? + "\n";
+        w.write_all(upd_s.as_bytes()).await?;
 
-        // ============================================================
-        // 3) TRAINING COMPLETED — CLEAN EXIT
-        // ============================================================
-        if !training_active && epochs_run > 0 {
-            println!("[{}] Training finished — exiting worker", id);
+        // small sleep
+        sleep(Duration::from_millis(500)).await;
+
+        if loss <= stop_loss {
+            println!("🏁 Worker {} stopping early, loss {:.6} <= stop_loss {:.6}", id, loss, stop_loss);
             break;
         }
-
-        // ============================================================
-        // 4) TRY READING ANY TCP MESSAGE FROM SERVER (MODEL ETC.)
-        // ============================================================
-        line.clear();
-        if let Ok(Ok(n)) = tokio::time::timeout(
-            Duration::from_millis(200),
-            reader.read_line(&mut line)
-        ).await {
-            if n > 0 {
-                if let Ok(msg) = serde_json::from_str::<Message>(&line) {
-                    if let Message::Model(m) = msg {
-                        println!("[{}] received global model from server", id);
-                        model_opt = Some(m);
-                    }
-                }
-            }
-        }
-
-        // ============================================================
-        // 5) FETCH DATASET IF AVAILABLE
-        // ============================================================
-        let dataset = if model_opt.is_some() {
-            match http.get(format!("{}/dataset", server_http)).send().await {
-                Ok(resp) => match resp.json::<Vec<(Vec<f32>, Vec<f32>)>>().await {
-                    Ok(ds) => ds,
-                    Err(_) => Vec::new(),
-                },
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-
-        // ============================================================
-        // 6) TRAIN ONE LOCAL STEP
-        // ============================================================
-        if let Some(mut local_model) = model_opt.clone() {
-            if dataset.is_empty() {
-                // fallback to synthetic batch
-                let (xs, ys) = make_synthetic_batch(16, local_model.layer_sizes[0]);
-                let loss = local_model.train_step(&xs, &ys, 0.01);
-                println!("[{}] local loss (synthetic): {:.4}", id, loss);
-            } else {
-                // real dataset training
-                let xs: Vec<_> = dataset.iter().map(|p| p.0.clone()).collect();
-                let ys: Vec<_> = dataset.iter().map(|p| p.1.clone()).collect();
-                let loss = local_model.train_step(&xs, &ys, 0.01);
-                println!("[{}] local loss: {:.4}", id, loss);
-            }
-
-            // ========================================================
-            // 7) SEND UPDATE
-            // ========================================================
-            let out = serde_json::to_string(&Message::ModelUpdate(local_model.clone()))?;
-            w.write_all(format!("{}\n", out).as_bytes()).await?;
-
-            // wait for new global model
-            line.clear();
-            if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(1000), reader.read_line(&mut line)).await {
-                if n > 0 {
-                    if let Ok(Message::Model(m)) = serde_json::from_str::<Message>(&line) {
-                        println!("[{}] received updated global model", id);
-                        model_opt = Some(m);
-                    }
-                }
-            }
-        } else {
-            // Still don't have a model — ask again
-            send_request_model(&mut w).await?;
-        }
-
-        // small wait to not overload network
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    println!("🏁 Worker {} finished training", id);
     Ok(())
-}
-
-// ===============================================================
-// Helpers
-// ===============================================================
-async fn send_request_model(w: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<()> {
-    let req = serde_json::to_string(&Message::RequestModel)?;
-    w.write_all(format!("{}\n", req).as_bytes()).await?;
-    Ok(())
-}
-
-fn make_synthetic_batch(batch: usize, dim: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-    let mut rng = rand::rng();
-    let mut xs = Vec::with_capacity(batch);
-    let mut ys = Vec::with_capacity(batch);
-
-    for _ in 0..batch {
-        let x: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-        let sum: f32 = x.iter().sum();
-        ys.push(vec![(sum > 0.0) as i32 as f32]);
-        xs.push(x);
-    }
-
-    (xs, ys)
 }

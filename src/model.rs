@@ -1,3 +1,4 @@
+// src/model.rs
 use rand::Rng;
 use serde::{Serialize, Deserialize};
 
@@ -47,12 +48,12 @@ impl DynamicModel {
                 for j in 0..in_n {
                     s += w[i * in_n + j] * inp[j];
                 }
-
-                if layer_idx + 1 == self.layer_sizes.len() - 1 {
-                    out[i] = s;
+                // final layer: linear, else ReLU
+                out[i] = if layer_idx + 1 == self.layer_sizes.len() - 1 {
+                    s
                 } else {
-                    out[i] = if s > 0.0 { s } else { 0.0 };
-                }
+                    if s > 0.0 { s } else { 0.0 }
+                };
             }
 
             inp = out.clone();
@@ -63,6 +64,7 @@ impl DynamicModel {
     }
 
     pub fn train_step(&mut self, xs: &Vec<Vec<f32>>, ys: &Vec<Vec<f32>>, lr: f32) -> f32 {
+        if xs.is_empty() { return 0.0; }
         let batch = xs.len() as f32;
         let mut total_loss = 0.0;
 
@@ -93,7 +95,6 @@ impl DynamicModel {
 
                 for i in 0..out_n {
                     gb[layer_idx][i] += upstream[i];
-
                     for j in 0..in_n {
                         let a = acts[layer_idx][j];
                         gw[layer_idx][i * in_n + j] += upstream[i] * a;
@@ -102,17 +103,14 @@ impl DynamicModel {
 
                 if layer_idx > 0 {
                     let mut downstream = vec![0.0; in_n];
-
                     for j in 0..in_n {
                         let mut s = 0.0;
-
                         for i in 0..out_n {
                             s += self.weights[layer_idx][i * in_n + j] * upstream[i];
                         }
-
+                        // ReLU backward
                         downstream[j] = if acts[layer_idx][j] > 0.0 { s } else { 0.0 };
                     }
-
                     upstream = downstream;
                 }
             }
@@ -135,12 +133,10 @@ impl DynamicModel {
 
         for li in 0..self.weights.len() {
             for i in 0..self.weights[li].len() {
-                self.weights[li][i] =
-                    alpha * self.weights[li][i] + (1.0 - alpha) * other.weights[li][i];
+                self.weights[li][i] = alpha * self.weights[li][i] + (1.0 - alpha) * other.weights[li][i];
             }
             for i in 0..self.biases[li].len() {
-                self.biases[li][i] =
-                    alpha * self.biases[li][i] + (1.0 - alpha) * other.biases[li][i];
+                self.biases[li][i] = alpha * self.biases[li][i] + (1.0 - alpha) * other.biases[li][i];
             }
         }
     }

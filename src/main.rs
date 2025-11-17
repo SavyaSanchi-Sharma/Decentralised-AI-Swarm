@@ -1,57 +1,48 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-
+// src/main.rs
 mod server;
 mod client;
 mod model;
 mod messages;
 
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use dotenv::from_filename;
+use std::env;
+
 #[derive(Parser)]
-#[command(name = "swarm")]
-#[command(about = "Federated training server + workers (dynamic, advanced)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    cmd: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the federated server (TCP for clients + HTTP REST API)
-    Server {
-        #[arg(long, default_value_t = String::from("0.0.0.0:50000"))]
-        tcp_addr: String,
-        #[arg(long, default_value_t = String::from("0.0.0.0:7000"))]
-        http_addr: String,
-        #[arg(long, default_value_t = 5000)]
-        sync_interval_ms: u64,
-        #[arg(long, default_value_t = String::from("training.log"))]
-        log_file: String,
-    },
-
-    /// Start a worker client node
+    Server,
     Client {
         #[arg(long)]
         id: String,
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        http: String, // http base like http://127.0.0.1:7000
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // load project.env (fail fast)
+    from_filename("project.env").ok();
+
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Server { tcp_addr, http_addr, sync_interval_ms, log_file } => {
-            println!("🚀 Starting server: tcp={} http={}", tcp_addr, http_addr);
-            server::Server::run(&tcp_addr, &http_addr, sync_interval_ms, log_file).await?;
+    let http = env::var("HTTP_ADDR").expect("HTTP_ADDR not set in project.env");
+    let tcp = env::var("TCP_ADDR").expect("TCP_ADDR not set in project.env");
+    let api_key = env::var("API_KEY").expect("API_KEY not set in project.env");
+
+    match cli.cmd {
+        Commands::Server => {
+            server::Server::run(&tcp, &http, api_key).await?;
         }
-        Commands::Client { id, server, http } => {
-            println!("🤖 Starting client: id={} server={} http={}", id, server, http);
-            client::run_client(&id, &server, &http).await?;
+        Commands::Client { id } => {
+            // pass http as full base URI (no leading http:// in env, so add)
+            let http_base = format!("http://{}", http);
+            client::run_client(&id, &tcp, &http_base).await?;
         }
     }
 
