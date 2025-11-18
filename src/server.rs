@@ -1,4 +1,3 @@
-// src/server.rs
 use anyhow::Result;
 use axum::{
     extract::{Query, State, ws::WebSocketUpgrade, ws::Message, ws::WebSocket},
@@ -20,6 +19,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{broadcast, mpsc::unbounded_channel, mpsc::UnboundedSender},
 };
+use chrono;
 use crate::{messages::TcpMessage, model::DynamicModel};
 
 #[derive(Clone)]
@@ -53,122 +53,115 @@ pub struct ServerState {
     pub tcp_senders: Arc<Mutex<HashMap<String, UnboundedSender<String>>>>,
     pub api_key: String,
     pub broadcaster: broadcast::Sender<Value>,
+    // keep published addresses for discovery
+    pub http_addr: String,
+    pub tcp_addr: String,
 }
 
 pub struct Server;
 
 impl Server {
     pub async fn run(
-    tcp_addr: &str,
-    http_addr: &str,
-    udp_addr: &str,
-    api_key: String
-) -> Result<()> {
+        tcp_addr: &str,
+        http_addr: &str,
+        udp_addr: &str,
+        api_key: String,
+    ) -> Result<()> {
+        println!("\n====== FEDERATED SERVER STARTED ======");
+        println!("HTTP: {}", http_addr);
+        println!("TCP : {}", tcp_addr);
+        println!("UDP : {}", udp_addr);
+        println!("API : {}", api_key);
+        println!("=====================================");
 
-    println!("\n====== FEDERATED SERVER STARTED ======");
-    println!("HTTP: {}", http_addr);
-    println!("TCP : {}", tcp_addr);
-    println!("UDP : {}", udp_addr);
-    println!("API : {}", api_key);
-    println!("=====================================");
+        let (tx, _rx) = broadcast::channel(128);
 
-    let (tx, _rx) = broadcast::channel(128);
+        let state = ServerState {
+            model: Arc::new(Mutex::new(None)),
+            model_versions: Arc::new(Mutex::new(Vec::new())),
+            next_model_version: Arc::new(Mutex::new(1)),
+            datasets: Arc::new(Mutex::new(HashMap::new())),
+            worker_sync: Arc::new(Mutex::new(HashMap::new())),
+            params: Arc::new(Mutex::new(TrainingParams { stop_loss: 0.01, max_epochs: 20 })),
+            tcp_senders: Arc::new(Mutex::new(HashMap::new())),
+            api_key,
+            broadcaster: tx,
+            http_addr: http_addr.to_string(),
+            tcp_addr: tcp_addr.to_string(),
+        };
 
-    let state = ServerState {
-        model: Arc::new(Mutex::new(None)),
-        model_versions: Arc::new(Mutex::new(Vec::new())),
-        next_model_version: Arc::new(Mutex::new(1)),
-        datasets: Arc::new(Mutex::new(HashMap::new())),
-        worker_sync: Arc::new(Mutex::new(HashMap::new())),
-        params: Arc::new(Mutex::new(TrainingParams { stop_loss: 0.01, max_epochs: 20 })),
-        tcp_senders: Arc::new(Mutex::new(HashMap::new())),
-        api_key,
-        broadcaster: tx,
-    };
+        // spawn TCP accept loop
+        let tcp_addr_owned = tcp_addr.to_string();
+        let tcp_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::tcp_accept_loop(&tcp_addr_owned, tcp_state).await {
+                eprintln!("TCP loop failed: {:?}", e);
+            }
+        });
 
-    // -------------------------------
-    // TCP Accept Loop
-    // -------------------------------
-    let tcp_addr_owned = tcp_addr.to_string();
-    let tcp_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = Self::tcp_accept_loop(&tcp_addr_owned, tcp_state).await {
-            eprintln!("TCP loop failed: {:?}", e);
-        }
-    });
+        // spawn UDP discovery responder
+        let udp_state = state.clone();
+        let udp_addr_owned = udp_addr.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = Self::udp_discovery_responder(&udp_addr_owned, udp_state).await {
+                eprintln!("UDP discovery failed: {:?}", e);
+            }
+        });
 
-    // -------------------------------
-    // UDP Discovery
-    // -------------------------------
-    let udp_addr_owned = udp_addr.to_string();
-    let udp_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = Self::udp_discovery_responder(&udp_addr_owned, udp_state).await {
-            eprintln!("UDP discovery failed: {:?}", e);
-        }
-    });
+        // build router
+        let router = Router::new()
+            .route("/create_model", post(Self::create_model))
+            .route("/upload_dataset", post(Self::upload_dataset))
+            .route("/register_worker", post(Self::register_worker))
+            .route("/set_training_params", post(Self::set_training_params))
+            .route("/start_training", post(Self::start_training))
+            .route("/get_dataset", get(Self::get_dataset))
+            .route("/get_model", get(Self::get_model))
+            .route("/get_training_params", get(Self::get_training_params))
+            .route("/sync_status", get(Self::sync_status))
+            .route("/download_model", get(Self::download_model))
+            .route("/ws", get(Self::ws_handler))
+            .with_state(state.clone());
 
-    // -------------------------------
-    // HTTP Router (AXUM)
-    // -------------------------------
-    let router = Router::new()
-        .route("/create_model", post(Self::create_model))
-        .route("/upload_dataset", post(Self::upload_dataset))
-        .route("/register_worker", post(Self::register_worker))
-        .route("/set_training_params", post(Self::set_training_params))
-        .route("/start_training", post(Self::start_training))
-        .route("/get_dataset", get(Self::get_dataset))
-        .route("/get_model", get(Self::get_model))
-        .route("/get_training_params", get(Self::get_training_params))
-        .route("/sync_status", get(Self::sync_status))
-        .route("/download_model", get(Self::download_model))
-        .route("/ws", get(Self::ws_handler))
-        .with_state(state.clone());
+        // bind HTTP
+        let addr: SocketAddr = http_addr.parse()?;
+        axum::Server::bind(&addr).serve(router.into_make_service()).await?;
 
-    // -------------------------------
-    // Bind HTTP Server
-    // -------------------------------
-    let addr: SocketAddr = http_addr.parse()?;
-    axum::Server::bind(&addr)
-        .serve(router.into_make_service())
-        .await?;
+        Ok(())
+    }
 
-    Ok(())
-}
+    async fn udp_discovery_responder(bind_addr: &str, state: ServerState) -> Result<()> {
+        // bind to provided interface (e.g., 10.0.0.251:9999 or 0.0.0.0:9999)
+        let sock = UdpSocket::bind(bind_addr).await?;
+        // allow broadcast
+        let _ = sock.set_broadcast(true);
+        println!("UDP discovery responder bound to {}", bind_addr);
 
+        let mut buf = [0u8; 1024];
 
-async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result<()> {
-    let sock = UdpSocket::bind(bind_addr).await?;
-    println!("UDP discovery responder bound to {}", bind_addr);
-
-    let mut buf = [0u8; 1024];
-
-    loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((n, src)) => {
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                if req.trim() == "DISCOVER_SWARM" {
-                    let info = json!({
-                        "http": "available",
-                        "note": "swarm_server"
-                    })
-                    .to_string();
-
-                    let _ = sock.send_to(info.as_bytes(), &src).await;
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                    if req == "DISCOVER_SWARM" {
+                        println!("📡 UDP discovery ping from {}", src);
+                        let info = json!({
+                            "http": state.http_addr,
+                            "tcp": state.tcp_addr,
+                            "note": "swarm_server"
+                        });
+                        let _ = sock.send_to(info.to_string().as_bytes(), &src).await;
+                    }
+                }
+                Err(e) => {
+                    println!("UDP recv error: {}", e);
                 }
             }
-            Err(e) => {
-                println!("UDP recv error: {}", e);
-            }
+            sleep(Duration::from_millis(50)).await;
         }
-
-        // small async sleep
-        sleep(Duration::from_millis(100)).await;
     }
-}
 
-    // ------------------ TCP accept loop ------------------
+    // tcp accept loop
     async fn tcp_accept_loop(addr: &str, state: ServerState) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         println!("TCP listening on {}", addr);
@@ -228,8 +221,9 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                     });
                     state.datasets.lock().unwrap().entry(worker_id.clone()).or_insert(vec![]);
 
-                    let _ = state.broadcaster.send(json!({"type":"worker_connect","worker": worker_id.clone()}));
+                    let _ = state.broadcaster.send(json!({"event":"worker_connect","worker": worker_id.clone()}));
 
+                    // push current model if exists
                     if let Some(m) = &*state.model.lock().unwrap() {
                         let msg = TcpMessage::Model { model: m.clone() };
                         let s = serde_json::to_string(&msg).unwrap();
@@ -240,12 +234,15 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                     println!("TCP update from {} round {}", worker_id, round);
 
                     {
+                        // merge into global model
                         let mut global = state.model.lock().unwrap();
                         if let Some(g) = &mut *global {
                             g.merge_inplace(&model, 0.5);
                         } else {
                             *global = Some(model.clone());
                         }
+
+                        // store version
                         let mut ver_guard = state.next_model_version.lock().unwrap();
                         let version = *ver_guard;
                         *ver_guard += 1;
@@ -253,11 +250,13 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                         state.model_versions.lock().unwrap().push((version, model.clone(), ts));
                     }
 
+                    // update worker info
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                     state.worker_sync.lock().unwrap().entry(worker_id.clone())
                         .and_modify(|wi| { wi.updates += 1; wi.last_seen = now; wi.state = WorkerState::Idle; })
-                        .or_insert(WorkerInfo { last_seen: now, updates:1, addr: None, state: WorkerState::Idle});
+                        .or_insert(WorkerInfo { last_seen: now, updates:1, addr: Some(peer.clone()), state: WorkerState::Idle});
 
+                    // broadcast model to all workers
                     let broadcast_model = {
                         let guard = state.model.lock().unwrap();
                         guard.as_ref().map(|m| TcpMessage::Model { model: m.clone() })
@@ -266,7 +265,6 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                     if let Some(msg) = broadcast_model {
                         let s = serde_json::to_string(&msg).unwrap();
                         let mut dead = Vec::new();
-
                         {
                             let senders = state.tcp_senders.lock().unwrap();
                             for (wid, sender) in senders.iter() {
@@ -275,24 +273,23 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                                 }
                             }
                         }
-
                         if !dead.is_empty() {
                             let mut map = state.tcp_senders.lock().unwrap();
                             for d in dead {
                                 map.remove(&d);
                                 println!("Removed dead tcp {}", d);
-                                let _ = state.broadcaster.send(json!({"type":"worker_dead","worker": d.clone()}));
+                                let _ = state.broadcaster.send(json!({"event":"worker_dead","worker": d.clone()}));
                             }
                         }
                     }
 
-                    let _ = state.broadcaster.send(json!({"type":"model_updated"}));
+                    let _ = state.broadcaster.send(json!({"event":"model_updated"}));
                 }
                 Ok(TcpMessage::Heartbeat { worker_id }) => {
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                     state.worker_sync.lock().unwrap().entry(worker_id.clone()).and_modify(|wi| { wi.last_seen = now; wi.state = WorkerState::Idle; })
                         .or_insert(WorkerInfo { last_seen: now, updates:0, addr: Some(peer.clone()), state: WorkerState::Idle });
-                    let _ = state.broadcaster.send(json!({"type":"heartbeat","worker": worker_id}));
+                    let _ = state.broadcaster.send(json!({"event":"heartbeat","worker": worker_id}));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -301,10 +298,11 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
             }
         }
 
+        // cleanup
         if let Some(wid) = worker_id_opt {
             state.tcp_senders.lock().unwrap().remove(&wid);
             state.worker_sync.lock().unwrap().remove(&wid);
-            let _ = state.broadcaster.send(json!({"type":"worker_disconnect","worker": wid}));
+            let _ = state.broadcaster.send(json!({"event":"worker_disconnect","worker": wid}));
         }
 
         Ok(())
@@ -348,7 +346,7 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
         state.model_versions.lock().unwrap().push((version, model.clone(), ts));
 
-        let _ = state.broadcaster.send(json!({"type":"model_created","version": version}));
+        let _ = state.broadcaster.send(json!({"event":"model_created","version": version}));
 
         println!("✔ Model created: {:?} (version {})", layers, version);
         Ok(Json(json!({"status":"ok","layer_sizes": layers, "version": version})))
@@ -401,7 +399,7 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
         });
 
         println!("🟢 Worker registered via HTTP: {}", worker_id);
-        let _ = state.broadcaster.send(json!({"type":"worker_register","worker": worker_id.clone()}));
+        let _ = state.broadcaster.send(json!({"event":"worker_register","worker": worker_id.clone()}));
         Ok(Json(json!({"status":"registered","worker_id":worker_id})))
     }
 
@@ -422,34 +420,57 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
         State(state): State<ServerState>,
         headers: HeaderMap,
     ) -> Result<Json<Value>, StatusCode> {
+        // API key check
         Self::check_api(&headers, &state.api_key)?;
-        // Block start if no model exists
+
+        // Model must exist
         if state.model.lock().unwrap().is_none() {
             return Err(StatusCode::BAD_REQUEST);
         }
 
         println!("🚀 Broadcast START to workers");
 
-        let msg = serde_json::to_string(&TcpMessage::Start).unwrap();
-        let mut dead = Vec::new();
-        let senders = state.tcp_senders.lock().unwrap();
-        for (wid, tx) in senders.iter() {
-            if tx.send(msg.clone()).is_err() {
-                dead.push(wid.clone());
-            } else {
-                if let Some(mut wi) = state.worker_sync.lock().unwrap().get_mut(wid) {
-                    wi.state = WorkerState::Training;
+        // Prepare START message
+        let start_msg = serde_json::to_string(&TcpMessage::Start).unwrap();
+
+        // Track disconnected workers
+        let mut dead: Vec<String> = Vec::new();
+
+        {
+            // Lock TCP senders + worker metadata
+            let senders = state.tcp_senders.lock().unwrap();
+            let mut worker_meta = state.worker_sync.lock().unwrap();
+
+            for (wid, tx) in senders.iter() {
+                // Send START message over TCP
+                if tx.send(start_msg.clone()).is_err() {
+                    dead.push(wid.clone());
+                } else {
+                    // Update worker metadata (requires WorkerState & WorkerInfo structs)
+                    if let Some(meta) = worker_meta.get_mut(wid) {
+                        meta.state = WorkerState::Training;
+                        meta.last_seen = chrono::Utc::now().timestamp() as u64;
+                    }
                 }
             }
         }
-        drop(senders);
+
+        // Remove dead workers
         if !dead.is_empty() {
             let mut map = state.tcp_senders.lock().unwrap();
-            for d in dead { map.remove(&d); }
+            for d in dead {
+                map.remove(&d);
+                state.worker_sync.lock().unwrap().remove(&d);
+                println!("⚠️ Removed dead worker: {}", d);
+            }
         }
 
-        let _ = state.broadcaster.send(json!({"type":"start"}));
-        Ok(Json(json!({"status":"started"})))
+        // WebSocket broadcast (MUST BE JSON Value)
+        let _ = state.broadcaster.send(json!({
+            "event": "training_started"
+        }));
+
+        Ok(Json(json!({"status": "started"})))
     }
 
     async fn get_dataset(
@@ -549,7 +570,7 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                 }
                 let versions = state.model_versions.lock().unwrap();
                 let versions_meta: Vec<Value> = versions.iter().map(|(v, _, ts)| json!({"version": v, "ts": ts})).collect();
-                json!({"type":"snapshot","workers": workers, "model_versions": versions_meta})
+                json!({"event":"snapshot","workers": workers, "model_versions": versions_meta})
             };
 
             if let Ok(txt) = serde_json::to_string(&snapshot) {
@@ -562,9 +583,7 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                         match res {
                             Ok(val) => {
                                 if let Ok(txt) = serde_json::to_string(&val) {
-                                    if socket.send(Message::Text(txt)).await.is_err() {
-                                        break;
-                                    }
+                                    if socket.send(Message::Text(txt)).await.is_err() { break; }
                                 }
                             }
                             Err(_) => break,
@@ -574,15 +593,9 @@ async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result
                     msg = socket.recv() => {
                         match msg {
                             Some(Ok( m)) => {
-                                // handle incoming WS messages from client if needed
-                                // for now, ignore text/ping etc. but respond to ping if present
                                 match m {
-                                    Message::Ping(p) => {
-                                        let _ = socket.send(Message::Pong(p)).await;
-                                    }
-                                    Message::Close(_) => {
-                                        break;
-                                    }
+                                    Message::Ping(p) => { let _ = socket.send(Message::Pong(p)).await; }
+                                    Message::Close(_) => { break; }
                                     _ => {}
                                 }
                             }
