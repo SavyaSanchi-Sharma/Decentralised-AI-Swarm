@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
     let http = env::var("HTTP_ADDR").expect("HTTP_ADDR not set in project.env");
     let tcp = env::var("TCP_ADDR").expect("TCP_ADDR not set in project.env");
     let api_key = env::var("API_KEY").expect("API_KEY not set in project.env");
+    let udp  = env::var("UDP_ADDR").unwrap_or("0.0.0.0:9999".to_string());
 
     // Normalize HTTP URI
     let http_base = if http.starts_with("http://") || http.starts_with("https://") {
@@ -38,8 +39,9 @@ async fn main() -> Result<()> {
         "server" => {
             println!("🚀 Starting server...");
             println!("HTTP = {}", http);
-            println!("TCP  = {}", tcp);
-            server::Server::run(&tcp, &http, api_key).await?;
+            println!("UDP  = {}", udp);
+            
+            server::Server::run(&tcp, &http,&udp, api_key).await?;
         }
 
         "client" => {

@@ -58,63 +58,84 @@ pub struct ServerState {
 pub struct Server;
 
 impl Server {
-    pub async fn run(tcp_addr: &str, http_addr: &str, api_key: String) -> Result<()> {
-        println!("\n====== FEDERATED SERVER STARTED ======");
-        println!("HTTP: {}", http_addr);
-        println!("TCP : {}", tcp_addr);
-        println!("API : {}", api_key);
-        println!("=====================================");
+    pub async fn run(
+    tcp_addr: &str,
+    http_addr: &str,
+    udp_addr: &str,
+    api_key: String
+) -> Result<()> {
 
-        let (tx, _rx) = broadcast::channel(128);
+    println!("\n====== FEDERATED SERVER STARTED ======");
+    println!("HTTP: {}", http_addr);
+    println!("TCP : {}", tcp_addr);
+    println!("UDP : {}", udp_addr);
+    println!("API : {}", api_key);
+    println!("=====================================");
 
-        let state = ServerState {
-            model: Arc::new(Mutex::new(None)),
-            model_versions: Arc::new(Mutex::new(Vec::new())),
-            next_model_version: Arc::new(Mutex::new(1)),
-            datasets: Arc::new(Mutex::new(HashMap::new())),
-            worker_sync: Arc::new(Mutex::new(HashMap::new())),
-            params: Arc::new(Mutex::new(TrainingParams { stop_loss: 0.01, max_epochs: 20 })),
-            tcp_senders: Arc::new(Mutex::new(HashMap::new())),
-            api_key,
-            broadcaster: tx,
-        };
+    let (tx, _rx) = broadcast::channel(128);
 
-        // TCP accept loop
-        let tcp_addr_owned = tcp_addr.to_string();
-        let tcp_state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::tcp_accept_loop(&tcp_addr_owned, tcp_state).await {
-                eprintln!("TCP loop failed: {:?}", e);
-            }
-        });
+    let state = ServerState {
+        model: Arc::new(Mutex::new(None)),
+        model_versions: Arc::new(Mutex::new(Vec::new())),
+        next_model_version: Arc::new(Mutex::new(1)),
+        datasets: Arc::new(Mutex::new(HashMap::new())),
+        worker_sync: Arc::new(Mutex::new(HashMap::new())),
+        params: Arc::new(Mutex::new(TrainingParams { stop_loss: 0.01, max_epochs: 20 })),
+        tcp_senders: Arc::new(Mutex::new(HashMap::new())),
+        api_key,
+        broadcaster: tx,
+    };
 
-        // UDP discovery responder
-        let udp_state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::udp_discovery_responder("0.0.0.0:9999", udp_state).await {
-                eprintln!("UDP discovery failed: {:?}", e);
-            }
-        });
+    // -------------------------------
+    // TCP Accept Loop
+    // -------------------------------
+    let tcp_addr_owned = tcp_addr.to_string();
+    let tcp_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = Self::tcp_accept_loop(&tcp_addr_owned, tcp_state).await {
+            eprintln!("TCP loop failed: {:?}", e);
+        }
+    });
 
-        let router = Router::new()
-            .route("/create_model", post(Self::create_model))
-            .route("/upload_dataset", post(Self::upload_dataset))
-            .route("/register_worker", post(Self::register_worker))
-            .route("/set_training_params", post(Self::set_training_params))
-            .route("/start_training", post(Self::start_training))
-            .route("/get_dataset", get(Self::get_dataset))
-            .route("/get_model", get(Self::get_model))
-            .route("/get_training_params", get(Self::get_training_params))
-            .route("/sync_status", get(Self::sync_status))
-            .route("/download_model", get(Self::download_model))
-            .route("/ws", get(Self::ws_handler))
-            .with_state(state.clone());
+    // -------------------------------
+    // UDP Discovery
+    // -------------------------------
+    let udp_addr_owned = udp_addr.to_string();
+    let udp_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = Self::udp_discovery_responder(&udp_addr_owned, udp_state).await {
+            eprintln!("UDP discovery failed: {:?}", e);
+        }
+    });
 
-        let addr: SocketAddr = http_addr.parse()?;
-        axum::Server::bind(&addr).serve(router.into_make_service()).await?;
+    // -------------------------------
+    // HTTP Router (AXUM)
+    // -------------------------------
+    let router = Router::new()
+        .route("/create_model", post(Self::create_model))
+        .route("/upload_dataset", post(Self::upload_dataset))
+        .route("/register_worker", post(Self::register_worker))
+        .route("/set_training_params", post(Self::set_training_params))
+        .route("/start_training", post(Self::start_training))
+        .route("/get_dataset", get(Self::get_dataset))
+        .route("/get_model", get(Self::get_model))
+        .route("/get_training_params", get(Self::get_training_params))
+        .route("/sync_status", get(Self::sync_status))
+        .route("/download_model", get(Self::download_model))
+        .route("/ws", get(Self::ws_handler))
+        .with_state(state.clone());
 
-        Ok(())
-    }
+    // -------------------------------
+    // Bind HTTP Server
+    // -------------------------------
+    let addr: SocketAddr = http_addr.parse()?;
+    axum::Server::bind(&addr)
+        .serve(router.into_make_service())
+        .await?;
+
+    Ok(())
+}
+
 
 async fn udp_discovery_responder(bind_addr: &str, _state: ServerState) -> Result<()> {
     let sock = UdpSocket::bind(bind_addr).await?;
