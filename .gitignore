@@ -1,2 +1,46 @@
-/target
-/.history/
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Environment / secrets
+project.env
+.env
+*.env
+
+# Editor & OS
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs & artefacts
+*.log
+*.json.bak
+training.log
+
+# History
+.history/
+
+# Downloaded / generated model outputs
+model.json
+model_*.json
